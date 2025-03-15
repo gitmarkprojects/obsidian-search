@@ -1,0 +1,9 @@
+{
+	"id": "ollama-vector-search",
+	"name": "Ollama Vector Search",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Vector search for your notes using Ollama embeddings.",
+	"author": "Mark Schröder",
+	"isDesktopOnly": true
+}

@@ -1,0 +1,90 @@
+/*
+
+This CSS file will be included with your plugin, and
+available in the app when your plugin is enabled.
+
+If your plugin does not need CSS, delete this file.
+
+*/
+
+.search-result {
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.search-result:hover {
+  background-color: var(--background-secondary);
+}
+
+.search-result-snippet {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.search-loading {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-muted);
+}
+
+.search-initial-message, 
+.search-no-results,
+.search-error {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-muted);
+}
+
+.search-error {
+  color: var(--text-error);
+}
+
+@keyframes dot-animation {
+  0% { opacity: 0.2; }
+  20% { opacity: 1; }
+  100% { opacity: 0.2; }
+}
+
+.search-loading span.dot-one,
+.search-loading span.dot-two,
+.search-loading span.dot-three {
+  animation: dot-animation 1.4s infinite;
+  animation-fill-mode: both;
+}
+
+.search-loading span.dot-one {
+  animation-delay: 0s;
+}
+
+.search-loading span.dot-two {
+  animation-delay: 0.2s;
+}
+
+.search-loading span.dot-three {
+  animation-delay: 0.4s;
+}
+
+.error-log-container table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.error-log-container th,
+.error-log-container td {
+  text-align: left;
+  padding: 6px;
+}
+
+.error-log-container tr:hover {
+  background-color: var(--background-secondary);
+}
+
+.error-details-row {
+  background-color: var(--background-secondary);
+}
+
+.error-log-empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 20px;
+}
