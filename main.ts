@@ -60,6 +60,7 @@ export default class OllamaSearchPlugin extends Plugin {
 	indexPath: string;
 	vectorIndex: VectorIndex = {};
 	isIndexed: boolean = false;
+	isIndexing: boolean = false; // FIX: Add flag to track indexing state
 	private vectorsCache: Map<string, number[]> = new Map();
 	private forceReindex: boolean = false;
 
@@ -80,6 +81,10 @@ export default class OllamaSearchPlugin extends Plugin {
 				new Notice('Please build the vector index first in settings');
 				return;
 			}
+			if (this.isIndexing) {
+				new Notice('Indexing in progress. Please wait...');
+				return;
+			}
 			new SearchModal(this.app, this).open();
 		});
 
@@ -92,6 +97,10 @@ export default class OllamaSearchPlugin extends Plugin {
 					new Notice('Please build the vector index first in settings');
 					return;
 				}
+				if (this.isIndexing) {
+					new Notice('Indexing in progress. Please wait...');
+					return;
+				}
 				new SearchModal(this.app, this).open();
 			}
 		});
@@ -101,8 +110,26 @@ export default class OllamaSearchPlugin extends Plugin {
 
 		// Load index and vectors if they exist
 		if (this.isIndexed) {
-			await this.loadVectorIndex();
-			this.vectorsCache = await this.loadVectorsFromBinary(); // Cache it now
+			try {
+				await this.loadVectorIndex();
+				try {
+					this.vectorsCache = await this.loadVectorsFromBinary();
+					// If we got an empty cache but the index exists, something is wrong
+					if (this.vectorsCache.size === 0 && Object.keys(this.vectorIndex).length > 0) {
+						this.logError("Vector data appears to be corrupted or empty", "Binary file could not be read properly");
+						new Notice("Vector data appears to be corrupted. Please rebuild the index.");
+						this.isIndexed = false;
+					}
+				} catch (error) {
+					this.logError("Failed to load vectors from binary file", error.message);
+					new Notice("Vector data appears to be corrupted. Please rebuild the index.");
+					this.isIndexed = false;
+				}
+			} catch (error) {
+				this.logError("Failed to load vector index", error.message);
+				new Notice("Vector index appears to be corrupted. Please rebuild the index.");
+				this.isIndexed = false;
+			}
 		}
 	}
 
@@ -153,6 +180,7 @@ export default class OllamaSearchPlugin extends Plugin {
 	async buildVectorIndex(forceRebuild: boolean = false) {
 		// Set the force reindex flag
 		this.forceReindex = forceRebuild;
+		this.isIndexing = true; // FIX: Set indexing flag
 		
 		const files = this.app.vault.getMarkdownFiles();
 		let indexingNotice = new Notice(`Indexing 0 / ${files.length} notes...`, 0);
@@ -163,102 +191,151 @@ export default class OllamaSearchPlugin extends Plugin {
 			this.vectorsCache.clear();
 		}
 
-		for (const [i, file] of files.entries()) {
-			const stat = await this.app.vault.adapter.stat(file.path);
-			if (!stat) {
-				// Can't retrieve file stats; skip
-				continue;
-			}
-
-			// Check if this file is already indexed and up to date
-			const oldChunks = Object.entries(this.vectorIndex)
-				.filter(([id, entry]) => entry.path === file.path);
-
-			// Only skip if not forcing reindex AND the file is up to date
-			const isUpToDate = !this.forceReindex && 
-				oldChunks.length > 0 && 
-				oldChunks.every(([id, entry]) => entry.mtime === stat.mtime);
-				
-			if (isUpToDate) {
-				continue;
-			}
-
-			try {
-				const content = await this.app.vault.read(file);
-				const chunks = this.chunkText(
-					content,
-					this.settings.chunkSize,
-					this.settings.chunkOverlap
-				);
-
-				// Generate embeddings per chunk
-				for (let cIndex = 0; cIndex < chunks.length; cIndex++) {
-					const chunk = chunks[cIndex];
-					const embedding = await this.getEmbedding(chunk);
-
-					// Generate a unique ID for each chunk
-					const id = this.generateId();
-
-					// Store in memory
-					this.vectorsCache.set(id, embedding);
-
-					// Update index
-					this.vectorIndex[id] = {
-						path: file.path,
-						title: file.basename,
-						mtime: stat.mtime,
-						chunkIndex: cIndex,
-						content: chunk
-					};
+		try { // FIX: Wrap in try/catch to ensure isIndexing is reset
+			for (const [i, file] of files.entries()) {
+				const stat = await this.app.vault.adapter.stat(file.path);
+				if (!stat) {
+					// Can't retrieve file stats; skip
+					continue;
 				}
 
-				if ((i + 1) % 10 === 0) {
-					indexingNotice.setMessage(`Indexing ${i + 1} / ${files.length} notes...`);
+				// Check if this file is already indexed and up to date
+				const oldChunks = Object.entries(this.vectorIndex)
+					.filter(([id, entry]) => entry.path === file.path);
+
+				const isUpToDate = !this.forceReindex && 
+					oldChunks.length > 0 && 
+					oldChunks.every(([id, entry]) => entry.mtime === stat.mtime);
+					
+				if (isUpToDate) {
+					continue;
 				}
-			} catch (error) {
-				console.error(`Error indexing ${file.path}:`, error);
+
+				// -- Minimal fix #1: Remove stale chunks for this file before reindexing
+				for (const [oldId, entry] of oldChunks) {
+					delete this.vectorIndex[oldId];
+					this.vectorsCache.delete(oldId);
+				}
+
+				try {
+					const content = await this.app.vault.read(file);
+					const chunks = this.chunkText(
+						content,
+						this.settings.chunkSize,
+						this.settings.chunkOverlap
+					);
+
+					// Generate embeddings per chunk
+					for (let cIndex = 0; cIndex < chunks.length; cIndex++) {
+						const chunk = chunks[cIndex];
+						const embedding = await this.getEmbedding(chunk);
+
+						// -- Minimal fix #3: Skip storing chunk if embedding is empty
+						if (embedding.length === 0) {
+							console.warn(`Embedding for ${file.path} chunk ${cIndex} is empty; skipping.`);
+							continue;
+						}
+
+						// -- Minimal fix #4: Ensure unique ID by checking for collisions
+						let id: string;
+						do {
+							id = this.generateId();
+						} while (this.vectorIndex[id]);
+
+						// Store in memory
+						this.vectorsCache.set(id, embedding);
+
+						// Update index
+						this.vectorIndex[id] = {
+							path: file.path,
+							title: file.basename,
+							mtime: stat.mtime,
+							chunkIndex: cIndex,
+							content: chunk
+						};
+					}
+
+					if ((i + 1) % 10 === 0) {
+						indexingNotice.setMessage(`Indexing ${i + 1} / ${files.length} notes...`);
+					}
+				} catch (error) {
+					console.error(`Error indexing ${file.path}:`, error);
+				}
 			}
+
+			// Save vectors to binary file
+			await this.saveVectorsToBinary(
+				Array.from(this.vectorsCache.entries()).map(([id, vector]) => ({ id, vector }))
+			);
+
+			// Save index
+			await this.saveVectorIndex();
+			this.isIndexed = true;
+		} catch (error) {
+			this.logError("Error during indexing", error.message);
+			throw error;
+		} finally {
+			indexingNotice.hide();
+			new Notice('Indexing complete!');
+			this.isIndexing = false; // FIX: Reset indexing flag
 		}
-
-		indexingNotice.hide();
-		new Notice('Indexing complete!');
-
-		// Save vectors to binary file
-		await this.saveVectorsToBinary(
-			Array.from(this.vectorsCache.entries()).map(([id, vector]) => ({ id, vector }))
-		);
-
-		// Save index
-		await this.saveVectorIndex();
-		this.isIndexed = true;
 	}
 
 	// -------------------------------------------------------------------
 	// Text chunking logic
 	// -------------------------------------------------------------------
 	private chunkText(text: string, size: number, overlap: number): string[] {
-		// Splits text into overlapping chunks of length `size` with `overlap` characters
-		// of overlap (except possibly the last chunk if the text ends).
+		// -- Minimal fix #2: Clamp overlap to avoid infinite loops
+		overlap = Math.min(overlap, size - 1);
+
 		const chunks: string[] = [];
-		let start = 0;
-
-		while (start < text.length) {
-			const end = start + size;
-			const chunk = text.slice(start, end);
-			chunks.push(chunk);
-
-			// Move start forward but incorporate overlap
-			start += (size - overlap);
+		
+		// FIX: Improve chunking to respect natural boundaries
+		// Split text into paragraphs first
+		const paragraphs = text.split(/\n\s*\n/);
+		let currentChunk = "";
+		
+		for (const paragraph of paragraphs) {
+			// If adding this paragraph would exceed the chunk size, 
+			// save the current chunk and start a new one
+			if (currentChunk.length + paragraph.length > size && currentChunk.length > 0) {
+				chunks.push(currentChunk);
+				// Include overlap from the end of the previous chunk
+				const overlapText = currentChunk.length > overlap 
+					? currentChunk.slice(-overlap) 
+					: currentChunk;
+				currentChunk = overlapText + paragraph;
+			} else {
+				// Add paragraph to current chunk
+				if (currentChunk.length > 0) {
+					currentChunk += "\n\n";
+				}
+				currentChunk += paragraph;
+			}
+			
+			// If current chunk exceeds size, split it further
+			while (currentChunk.length > size) {
+				const chunkToAdd = currentChunk.slice(0, size);
+				chunks.push(chunkToAdd);
+				currentChunk = currentChunk.slice(size - overlap);
+			}
 		}
+		
+		// Add the last chunk if it's not empty
+		if (currentChunk.length > 0) {
+			chunks.push(currentChunk);
+		}
+		
 		return chunks;
 	}
 
 	// -------------------------------------------------------------------
-	// Random ID generator (for chunk entries)
+	// Random ID generator (for chunk entries) -- slightly updated
 	// -------------------------------------------------------------------
 	generateId(): string {
+		// We'll leave the generation logic but let the caller verify collisions.
 		return Math.random().toString(36).substring(2, 15) +
-			Math.random().toString(36).substring(2, 15);
+			   Math.random().toString(36).substring(2, 15);
 	}
 
 	// -------------------------------------------------------------------
@@ -339,64 +416,118 @@ export default class OllamaSearchPlugin extends Plugin {
 			const view = new DataView(arrayBuffer);
 
 			let offset = 0;
-			while (offset < arrayBuffer.byteLength) {
-				// Read id length
-				const idLength = view.getUint16(offset, true);
-				offset += 2;
+			// Add a safety check to prevent infinite loops
+			let safetyCounter = 0;
+			const maxIterations = 100000; // Reasonable upper limit
+			
+			while (offset < arrayBuffer.byteLength && safetyCounter < maxIterations) {
+				safetyCounter++;
+				
+				try {
+					// Check if we have enough bytes left to read the ID length (2 bytes)
+					if (offset + 2 > arrayBuffer.byteLength) {
+						console.warn("Reached end of buffer while reading ID length");
+						break;
+					}
+					
+					// Read id length
+					const idLength = view.getUint16(offset, true);
+					offset += 2;
 
-				// Read id
-				let id = '';
-				for (let i = 0; i < idLength; i++) {
-					id += String.fromCharCode(view.getUint8(offset + i));
-				}
-				offset += idLength;
+					// Validate ID length to prevent buffer overruns
+					if (idLength <= 0 || idLength > 100 || offset + idLength > arrayBuffer.byteLength) {
+						console.warn(`Invalid ID length: ${idLength} at offset ${offset-2}`);
+						// Skip to next potential valid entry
+						offset = Math.min(offset + 4, arrayBuffer.byteLength);
+						continue;
+					}
 
-				// Align offset back to multiple of 4
-				while (offset % 4 !== 0) {
-					offset++;
-				}
+					// Read id
+					let id = '';
+					for (let i = 0; i < idLength; i++) {
+						id += String.fromCharCode(view.getUint8(offset + i));
+					}
+					offset += idLength;
 
-				// Read vector length
-				const vectorLength = view.getUint32(offset, true);
-				offset += 4;
+					// Align to multiple of 4
+					while (offset % 4 !== 0 && offset < arrayBuffer.byteLength) {
+						offset++;
+					}
 
-				// Read float32 array
-				const vector = new Array(vectorLength);
-				for (let i = 0; i < vectorLength; i++) {
-					vector[i] = view.getFloat32(offset, true);
+					// Check if we have enough bytes left to read the vector length (4 bytes)
+					if (offset + 4 > arrayBuffer.byteLength) {
+						console.warn("Reached end of buffer while reading vector length");
+						break;
+					}
+
+					// Read vector length
+					const vectorLength = view.getUint32(offset, true);
 					offset += 4;
-				}
 
-				vectors.set(id, vector);
+					// Validate vector length to prevent buffer overruns
+					if (vectorLength <= 0 || vectorLength > 10000 || offset + (vectorLength * 4) > arrayBuffer.byteLength) {
+						console.warn(`Invalid vector length: ${vectorLength} at offset ${offset-4}`);
+						// Skip to next potential valid entry
+						offset = Math.min(offset + 4, arrayBuffer.byteLength);
+						continue;
+					}
+
+					// Read float32 array
+					const vector = new Array(vectorLength);
+					for (let i = 0; i < vectorLength; i++) {
+						vector[i] = view.getFloat32(offset, true);
+						offset += 4;
+					}
+
+					vectors.set(id, vector);
+				} catch (error) {
+					// Log error but try to continue with next vector
+					console.error("Error reading vector at offset", offset, error);
+					// Skip ahead by 4 bytes to try to recover
+					offset = Math.min(offset + 4, arrayBuffer.byteLength);
+				}
+			}
+			
+			if (safetyCounter >= maxIterations) {
+				console.warn("Reached maximum iterations while reading vectors file. File may be corrupted.");
 			}
 
 			console.log(`Loaded ${vectors.size} vectors from binary file`);
 			return vectors;
 		} catch (error) {
 			console.error("Error loading vectors from binary:", error);
-			throw error;
+			// Return empty map instead of throwing to prevent crashes
+			return new Map<string, number[]>();
 		}
 	}
 
 	// -------------------------------------------------------------------
 	// Embedding & Similarity
 	// -------------------------------------------------------------------
-	async getEmbedding(text: string): Promise<number[]> {
+	async getEmbedding(text: string, retryCount = 0): Promise<number[]> {
+		const maxRetries = 2; // Allow up to 2 retries
+		
 		try {
-			const response = await fetch(`${this.settings.ollamaEndpoint}/api/embeddings`, {
+			const response = await fetch(`${this.settings.ollamaEndpoint}/api/embed`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					model: this.settings.modelName,
-					prompt: text
+					input: text
 				})
 			});
 			if (!response.ok) {
-				throw new Error(`Ollama responded with ${response.status} ${response.statusText}`);
+				const errorText = await response.text();
+				throw new Error(`Ollama responded with ${response.status} ${response.statusText}: ${errorText}`);
 			}
 			const data = await response.json();
-			return data.embedding;
+			
+			// The response format is different - embeddings is an array of arrays
+			// We want the first (and likely only) embedding
+			return data.embeddings?.[0] || [];
 		} catch (err) {
+			this.logError(`Failed to get embedding from Ollama`, err.message || err.toString());
+			
 			new Notice(`Failed to get embedding from Ollama: ${err.message}`);
 			console.error(err);
 			// Return an empty embedding to avoid further errors
@@ -412,6 +543,12 @@ export default class OllamaSearchPlugin extends Plugin {
 		const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
 		const magA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
 		const magB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+		
+		// FIX: Handle zero magnitude vectors
+		if (magA === 0 || magB === 0) {
+			return 0;
+		}
+		
 		return dotProduct / (magA * magB);
 	}
 
@@ -420,7 +557,17 @@ export default class OllamaSearchPlugin extends Plugin {
 	// -------------------------------------------------------------------
 	async searchSimilar(query: string): Promise<SearchResult[]> {
 		try {
+			// FIX: Check if indexing is in progress
+			if (this.isIndexing) {
+				throw new Error("Indexing in progress. Please try again later.");
+			}
+			
 			const queryEmbedding = await this.getEmbedding(query);
+			
+			// FIX: Check if embedding was successful
+			if (!queryEmbedding || queryEmbedding.length === 0) {
+				throw new Error("Failed to generate embedding for query");
+			}
 
 			// Use the vectorsCache to compare
 			const results: SearchResult[] = Array.from(this.vectorsCache.entries())
@@ -440,6 +587,7 @@ export default class OllamaSearchPlugin extends Plugin {
 
 			return results;
 		} catch (error) {
+			this.logError("Search error", error.message || error.toString());
 			console.error("Search error:", error);
 			return [];
 		}
@@ -477,6 +625,33 @@ export default class OllamaSearchPlugin extends Plugin {
 		
 		// Also log to console for immediate debugging
 		console.error(`Ollama API Error: ${message}`, details);
+	}
+
+	// New method for batch embedding
+	async getBatchEmbeddings(texts: string[]): Promise<number[][]> {
+		try {
+			const response = await fetch(`${this.settings.ollamaEndpoint}/api/embed`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					model: this.settings.modelName,
+					input: texts
+				})
+			});
+			
+			if (!response.ok) {
+				const errorText = await response.text();
+				throw new Error(`Ollama responded with ${response.status} ${response.statusText}: ${errorText}`);
+			}
+			
+			const data = await response.json();
+			return data.embeddings || [];
+		} catch (err) {
+			this.logError(`Failed to get batch embeddings from Ollama`, err.message || err.toString());
+			console.error(err);
+			// Return an empty array to avoid further errors
+			return [];
+		}
 	}
 }
 
@@ -618,10 +793,29 @@ class SearchModal extends Modal {
 			
 		} catch (error) {
 			this.clearResults();
-			this.resultsContainer.createEl('div', {
-				text: `Error: ${error.message || 'Failed to search'}`,
+			
+			// Create a more informative error message
+			const errorEl = this.resultsContainer.createEl('div', {
 				cls: 'search-error'
 			});
+			
+			// Main error message
+			errorEl.createEl('p', {
+				text: `Error: ${error.message || 'Failed to search'}`
+			});
+			
+			// Add troubleshooting tips
+			const tipsList = errorEl.createEl('ul');
+			tipsList.createEl('li', {
+				text: 'Make sure Ollama is running on your machine'
+			});
+			tipsList.createEl('li', {
+				text: `Check that the model "${this.plugin.settings.modelName}" is available in Ollama`
+			});
+			tipsList.createEl('li', {
+				text: 'Verify your Ollama endpoint in the plugin settings'
+			});
+			
 		} finally {
 			this.isSearching = false;
 		}
@@ -682,7 +876,13 @@ class OllamaSettingTab extends PluginSettingTab {
 				.setPlaceholder('5')
 				.setValue(this.plugin.settings.maxResults.toString())
 				.onChange(async (value) => {
-					this.plugin.settings.maxResults = parseInt(value) || 5;
+					// FIX: Validate input
+					const numValue = parseInt(value);
+					if (isNaN(numValue) || numValue < 1) {
+						new Notice("Max results must be a positive number");
+						return;
+					}
+					this.plugin.settings.maxResults = numValue;
 					await this.plugin.saveSettings();
 				}));
 
@@ -693,7 +893,13 @@ class OllamaSettingTab extends PluginSettingTab {
 				.setPlaceholder('1000')
 				.setValue(this.plugin.settings.chunkSize.toString())
 				.onChange(async (value) => {
-					this.plugin.settings.chunkSize = parseInt(value) || 1000;
+					// FIX: Validate input
+					const numValue = parseInt(value);
+					if (isNaN(numValue) || numValue < 100) {
+						new Notice("Chunk size must be at least 100 characters");
+						return;
+					}
+					this.plugin.settings.chunkSize = numValue;
 					await this.plugin.saveSettings();
 				}));
 
@@ -704,7 +910,13 @@ class OllamaSettingTab extends PluginSettingTab {
 				.setPlaceholder('200')
 				.setValue(this.plugin.settings.chunkOverlap.toString())
 				.onChange(async (value) => {
-					this.plugin.settings.chunkOverlap = parseInt(value) || 200;
+					// FIX: Validate input
+					const numValue = parseInt(value);
+					if (isNaN(numValue) || numValue < 0) {
+						new Notice("Chunk overlap must be a non-negative number");
+						return;
+					}
+					this.plugin.settings.chunkOverlap = numValue;
 					await this.plugin.saveSettings();
 				}));
 
@@ -717,6 +929,7 @@ class OllamaSettingTab extends PluginSettingTab {
 			.addButton(button => button
 				.setButtonText(this.plugin.isIndexed ? 'Rebuild Index' : 'Build Index')
 				.setCta()
+				.setDisabled(this.plugin.isIndexing) // FIX: Disable during indexing
 				.onClick(async () => {
 					button.setButtonText('Indexing...');
 					button.setDisabled(true);
@@ -727,99 +940,106 @@ class OllamaSettingTab extends PluginSettingTab {
 						await this.plugin.buildVectorIndex(forceRebuild);
 						button.setButtonText(this.plugin.isIndexed ? 'Rebuild Index' : 'Build Index');
 						button.setDisabled(false);
-						this.display(); // Refresh
 					} catch (error) {
-						new Notice('Error building index: ' + error);
-						button.setButtonText('Retry');
+						new Notice(`Indexing failed: ${error.message}`);
+						button.setButtonText('Retry Indexing');
 						button.setDisabled(false);
 					}
 				}));
 
 		// Error logs section
 		containerEl.createEl('h3', {text: 'Error Logs'});
-
-		const errorLogContainer = containerEl.createDiv('error-log-container');
-		errorLogContainer.style.maxHeight = '300px';
-		errorLogContainer.style.overflow = 'auto';
-		errorLogContainer.style.border = '1px solid var(--background-modifier-border)';
-		errorLogContainer.style.borderRadius = '4px';
-		errorLogContainer.style.padding = '8px';
-		errorLogContainer.style.marginBottom = '16px';
-
+		
+		const errorLogContainer = containerEl.createDiv({cls: 'error-log-container'});
+		
 		if (this.plugin.settings.errorLogs.length === 0) {
-			errorLogContainer.createEl('p', {
-				text: 'No errors logged yet.',
+			errorLogContainer.createEl('div', {
+				text: 'No errors logged',
 				cls: 'error-log-empty'
 			});
 		} else {
-			// Create a table for the logs
 			const table = errorLogContainer.createEl('table');
-			table.style.width = '100%';
-			table.style.borderCollapse = 'collapse';
+			const headerRow = table.createEl('tr');
+			headerRow.createEl('th', {text: 'Time'});
+			headerRow.createEl('th', {text: 'Error'});
+			headerRow.createEl('th', {text: 'Actions'});
 			
-			// Table header
-			const thead = table.createEl('thead');
-			const headerRow = thead.createEl('tr');
-			headerRow.createEl('th', {text: 'Time'}).style.textAlign = 'left';
-			headerRow.createEl('th', {text: 'Error'}).style.textAlign = 'left';
-			
-			// Table body
-			const tbody = table.createEl('tbody');
-			
-			for (const log of this.plugin.settings.errorLogs) {
-				const row = tbody.createEl('tr');
-				row.style.borderBottom = '1px solid var(--background-modifier-border)';
+			for (const error of this.plugin.settings.errorLogs) {
+				const row = table.createEl('tr');
 				
 				// Format timestamp
-				const date = new Date(log.timestamp);
-				const timeCell = row.createEl('td');
-				timeCell.style.padding = '4px';
-				timeCell.style.whiteSpace = 'nowrap';
-				timeCell.textContent = date.toLocaleString();
+				const date = new Date(error.timestamp);
+				row.createEl('td', {
+					text: date.toLocaleString()
+				});
 				
 				// Error message
-				const messageCell = row.createEl('td');
-				messageCell.style.padding = '4px';
-				messageCell.textContent = log.message;
+				row.createEl('td', {
+					text: error.message
+				});
 				
-				// Make the row expandable if there are details
-				if (log.details) {
-					row.style.cursor = 'pointer';
-					row.addEventListener('click', () => {
-						// Check if details row already exists
-						const nextRow = row.nextElementSibling;
-						if (nextRow && nextRow.classList.contains('error-details-row')) {
-							nextRow.remove();
+				// Actions cell
+				const actionsCell = row.createEl('td');
+				
+				// View details button (only if details exist)
+				if (error.details) {
+					const viewButton = actionsCell.createEl('button', {
+						text: 'Details',
+						cls: 'mod-cta'
+					});
+					viewButton.style.marginRight = '5px';
+					viewButton.addEventListener('click', () => {
+						// Toggle details row
+						const detailsId = `error-${error.timestamp}`;
+						const existingDetails = table.querySelector(`#${detailsId}`);
+						
+						if (existingDetails) {
+							existingDetails.remove();
 						} else {
-							const detailsRow = tbody.createEl('tr');
-							detailsRow.classList.add('error-details-row');
-							detailsRow.style.backgroundColor = 'var(--background-secondary)';
+							const detailsRow = table.createEl('tr', {
+								cls: 'error-details-row'
+							});
+							detailsRow.id = detailsId;
 							
 							const detailsCell = detailsRow.createEl('td', {
-								attr: { colspan: '2' }
+								attr: {colspan: '3'}
 							});
-							detailsCell.style.padding = '8px';
-							detailsCell.style.fontFamily = 'monospace';
-							detailsCell.style.whiteSpace = 'pre-wrap';
-							detailsCell.textContent = log.details ?? '';
 							
+							const pre = detailsCell.createEl('pre');
+							pre.createEl('code', {
+								text: error.details
+							});
+							
+							// Insert after the current row
 							row.after(detailsRow);
 						}
 					});
 				}
 			}
+			
+			// Add clear logs button
+			const clearButtonContainer = errorLogContainer.createDiv();
+			clearButtonContainer.style.marginTop = '10px';
+			clearButtonContainer.style.textAlign = 'right';
+			
+			const clearButton = clearButtonContainer.createEl('button', {
+				text: 'Clear Error Logs',
+				cls: 'mod-warning'
+			});
+			
+			clearButton.addEventListener('click', async () => {
+				this.plugin.settings.errorLogs = [];
+				await this.plugin.saveSettings();
+				this.display(); // Refresh the settings tab
+			});
 		}
-
-		// Add button to clear logs
-		new Setting(containerEl)
-			.setName('Clear Error Logs')
-			.setDesc('Remove all error logs')
-			.addButton(button => button
-				.setButtonText('Clear Logs')
-				.onClick(async () => {
-					this.plugin.settings.errorLogs = [];
-					await this.plugin.saveSettings();
-					this.display(); // Refresh the settings view
-				}));
 	}
 }
+
+
+
+
+
+
+
+ 
