@@ -1,12 +1,3 @@
-/*
-
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
-
-If your plugin does not need CSS, delete this file.
-
-*/
-
 .search-result {
   cursor: pointer;
   transition: background-color 0.2s ease;
@@ -87,4 +78,60 @@ If your plugin does not need CSS, delete this file.
   color: var(--text-muted);
   text-align: center;
   padding: 20px;
+}
+
+/* Simplified search results styling */
+.search-result-card {
+  padding: 10px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+}
+
+.search-result-title {
+  font-weight: bold;
+  margin-bottom: 5px;
+}
+
+.search-result-path {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin-bottom: 5px;
+}
+
+.search-result-content {
+  font-size: 0.9em;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.search-result-score {
+  font-size: 0.8em;
+  margin-left: 8px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background-color: var(--background-secondary);
+}
+
+/* Remove fancy score coloring */
+.search-results-count {
+  margin-bottom: 10px;
+  padding: 5px;
+  text-align: center;
+  font-size: 0.9em;
+  color: var(--text-muted);
+}
+
+/* Keep the loading, error and initial message styles simple */
+.search-loading,
+.search-initial-message, 
+.search-no-results,
+.search-error {
+  text-align: center;
+  padding: 15px;
+  color: var(--text-muted);
+}
+
+.search-error {
+  color: var(--text-error);
 }

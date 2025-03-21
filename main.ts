@@ -1,5 +1,4 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
-import * as fs from 'fs';
+import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 import * as path from 'path';
 
 // -------------------------------------------------------------------
@@ -13,6 +12,8 @@ interface OllamaSearchPluginSettings {
 	chunkSize: number;        // New: chunk size in characters
 	chunkOverlap: number;     // New: overlap in characters
 	errorLogs: ErrorLogEntry[]; // New: store error logs
+	autoIndex: boolean;        // New: auto-index on file changes
+	excludeFolders: string[]; // New: folders to exclude from indexing
 }
 
 interface VectorIndexEntry {
@@ -21,6 +22,8 @@ interface VectorIndexEntry {
 	mtime: number;         // Last modified time
 	chunkIndex: number;    // Which chunk number of the file
 	content: string;       // The chunk text
+	blockRef?: string;     // New: block reference ID for navigation
+	tags?: string[];       // New: tags associated with this chunk's note
 }
 
 interface VectorIndex {
@@ -33,6 +36,7 @@ interface SearchResult {
 	path: string;
 	title: string;
 	content: string; // The chunk content for this search result
+	blockRef?: string;
 }
 
 interface ErrorLogEntry {
@@ -41,19 +45,27 @@ interface ErrorLogEntry {
 	details?: string;
 }
 
+// Info per file for indexing
+interface FileInfo {
+	mtime: number;
+	tags: Set<string>;
+	ids: string[];
+}
+
 const DEFAULT_SETTINGS: OllamaSearchPluginSettings = {
 	ollamaEndpoint: 'http://localhost:11434',
 	modelName: 'jeffh/intfloat-multilingual-e5-large-instruct:q8_0',
 	maxResults: 5,
-	chunkSize: 1000,      // Default chunk size in characters
+	chunkSize: 1200,      // Default chunk size in characters
 	chunkOverlap: 200,    // Default overlap in characters
-	errorLogs: []         // Initialize empty error logs
+	errorLogs: [],        // Initialize empty error logs
+	autoIndex: false,
+	excludeFolders: []
 };
 
 // -------------------------------------------------------------------
 // Main Plugin
 // -------------------------------------------------------------------
-
 export default class OllamaSearchPlugin extends Plugin {
 	settings: OllamaSearchPluginSettings;
 	vectorsPath: string;
@@ -63,6 +75,8 @@ export default class OllamaSearchPlugin extends Plugin {
 	isIndexing: boolean = false; // FIX: Add flag to track indexing state
 	private vectorsCache: Map<string, number[]> = new Map();
 	private forceReindex: boolean = false;
+	private isSearchQuery: boolean = false;
+	private fileInfoMap: Map<string, FileInfo> = new Map();
 
 	async onload() {
 		await this.loadSettings();
@@ -131,6 +145,26 @@ export default class OllamaSearchPlugin extends Plugin {
 				this.isIndexed = false;
 			}
 		}
+		if (this.isIndexed) {
+			this.initializeFileInfoMap();
+		}
+		// Register vault events for incremental indexing
+		this.registerEvent(this.app.vault.on('modify', (file: TFile) => {
+			if (!this.settings.autoIndex || file.extension !== 'md') return;
+			this.indexFile(file);
+		}));
+		this.registerEvent(this.app.vault.on('create', (file: TFile) => {
+			if (!this.settings.autoIndex || file.extension !== 'md') return;
+			this.indexFile(file);
+		}));
+		this.registerEvent(this.app.vault.on('delete', (file: TFile) => {
+			if (!this.settings.autoIndex || file.extension !== 'md') return;
+			this.removeFromIndex(file.path);
+		}));
+		this.registerEvent(this.app.vault.on('rename', (file: TFile, oldPath: string) => {
+			if (file.extension !== 'md') return;
+			this.updateIndexForRename(oldPath, file.path, file);
+		}));
 	}
 
 	// -------------------------------------------------------------------
@@ -160,6 +194,7 @@ export default class OllamaSearchPlugin extends Plugin {
 		} catch (error) {
 			console.error("Error loading vector index:", error);
 			this.vectorIndex = {};
+			this.fileInfoMap.clear();
 		}
 	}
 
@@ -174,6 +209,24 @@ export default class OllamaSearchPlugin extends Plugin {
 		}
 	}
 
+	// Initialize or rebuild file information map from vectorIndex
+	private initializeFileInfoMap(): void {
+		this.fileInfoMap.clear();
+		for (const [id, entry] of Object.entries(this.vectorIndex)) {
+			const filePath = entry.path;
+			let info = this.fileInfoMap.get(filePath);
+			if (!info) {
+				info = {
+					mtime: entry.mtime,
+					tags: new Set(entry.tags ?? []),
+					ids: []
+				};
+				this.fileInfoMap.set(filePath, info);
+			}
+			info.ids.push(id);
+		}
+	}
+
 	// -------------------------------------------------------------------
 	// Building / Rebuilding the index
 	// -------------------------------------------------------------------
@@ -181,7 +234,7 @@ export default class OllamaSearchPlugin extends Plugin {
 		// Set the force reindex flag
 		this.forceReindex = forceRebuild;
 		this.isIndexing = true; // FIX: Set indexing flag
-		
+
 		const files = this.app.vault.getMarkdownFiles();
 		let indexingNotice = new Notice(`Indexing 0 / ${files.length} notes...`, 0);
 
@@ -189,6 +242,7 @@ export default class OllamaSearchPlugin extends Plugin {
 		if (this.forceReindex) {
 			this.vectorIndex = {};
 			this.vectorsCache.clear();
+			this.fileInfoMap.clear();
 		}
 
 		try { // FIX: Wrap in try/catch to ensure isIndexing is reset
@@ -206,7 +260,7 @@ export default class OllamaSearchPlugin extends Plugin {
 				const isUpToDate = !this.forceReindex && 
 					oldChunks.length > 0 && 
 					oldChunks.every(([id, entry]) => entry.mtime === stat.mtime);
-					
+										
 				if (isUpToDate) {
 					continue;
 				}
@@ -225,10 +279,21 @@ export default class OllamaSearchPlugin extends Plugin {
 						this.settings.chunkOverlap
 					);
 
-					// Generate embeddings per chunk
+					// NEW: get all chunk embeddings in one batch
+					const embeddings = await this.getBatchEmbeddings(chunks);
+
+					// Validate length to avoid mismatch
+					if (embeddings.length !== chunks.length) {
+						console.warn(
+							`Batch embeddings returned ${embeddings.length} vectors for ${chunks.length} chunks in file: ${file.path}`
+						);
+					}
+
+					// Store each embedding
+					const fileIds: string[] = [];
 					for (let cIndex = 0; cIndex < chunks.length; cIndex++) {
 						const chunk = chunks[cIndex];
-						const embedding = await this.getEmbedding(chunk);
+						const embedding = embeddings[cIndex] ?? [];
 
 						// -- Minimal fix #3: Skip storing chunk if embedding is empty
 						if (embedding.length === 0) {
@@ -242,6 +307,9 @@ export default class OllamaSearchPlugin extends Plugin {
 							id = this.generateId();
 						} while (this.vectorIndex[id]);
 
+						// Generate a block reference ID for this chunk
+						const blockRef = `^chunk-${this.generateId().substring(0, 8)}`;
+
 						// Store in memory
 						this.vectorsCache.set(id, embedding);
 
@@ -251,9 +319,15 @@ export default class OllamaSearchPlugin extends Plugin {
 							title: file.basename,
 							mtime: stat.mtime,
 							chunkIndex: cIndex,
-							content: chunk
+							content: chunk,
+							blockRef: blockRef,
+							tags: []
 						};
+						fileIds.push(id);
 					}
+					// Update file info map for this file
+					const tags = this.extractTagsFromContent(content);
+					this.fileInfoMap.set(file.path, { mtime: stat.mtime, tags: new Set(tags), ids: fileIds });
 
 					if ((i + 1) % 10 === 0) {
 						indexingNotice.setMessage(`Indexing ${i + 1} / ${files.length} notes...`);
@@ -299,7 +373,10 @@ export default class OllamaSearchPlugin extends Plugin {
 			// If adding this paragraph would exceed the chunk size, 
 			// save the current chunk and start a new one
 			if (currentChunk.length + paragraph.length > size && currentChunk.length > 0) {
-				chunks.push(currentChunk);
+				// Only add chunk if it passes the entropy filter
+				if (this.hasAdequateEntropy(currentChunk)) {
+					chunks.push(currentChunk);
+				}
 				// Include overlap from the end of the previous chunk
 				const overlapText = currentChunk.length > overlap 
 					? currentChunk.slice(-overlap) 
@@ -316,17 +393,84 @@ export default class OllamaSearchPlugin extends Plugin {
 			// If current chunk exceeds size, split it further
 			while (currentChunk.length > size) {
 				const chunkToAdd = currentChunk.slice(0, size);
-				chunks.push(chunkToAdd);
+				// Only add chunk if it passes the entropy filter
+				if (this.hasAdequateEntropy(chunkToAdd)) {
+					chunks.push(chunkToAdd);
+				}
 				currentChunk = currentChunk.slice(size - overlap);
 			}
 		}
 		
-		// Add the last chunk if it's not empty
-		if (currentChunk.length > 0) {
+		// Add the last chunk if it's not empty and passes the filter
+		if (currentChunk.length > 0 && this.hasAdequateEntropy(currentChunk)) {
 			chunks.push(currentChunk);
 		}
 		
 		return chunks;
+	}
+
+	// NEW: Calculate Shannon entropy of text to detect repetitive content
+	private hasAdequateEntropy(text: string): boolean {
+		// Minimum text length to consider
+		if (text.length < 20) return true;
+		
+		// Calculate character-level entropy
+		const charEntropy = this.calculateEntropy(text);
+		
+		// Calculate word-level entropy for additional insight
+		const words = text.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+		const wordEntropy = words.length > 5 ? this.calculateEntropy(words) : 0;
+		
+		// Thresholds based on empirical testing
+		// Character entropy below 3.0 bits usually indicates highly repetitive text
+		// For reference: random English text typically has 4.0-4.5 bits of entropy per character
+		const charEntropyThreshold = 3.0;
+		
+		// Word entropy below 2.5 bits usually indicates repetitive word usage
+		// For reference: normal English text typically has 7-10 bits of entropy per word
+		// We're using a lower threshold since we're calculating on a small sample
+		const wordEntropyThreshold = 2.5;
+		
+		// For very short texts, we mainly rely on character entropy
+		if (words.length < 10) {
+			return charEntropy >= charEntropyThreshold;
+		}
+		
+		// For longer texts, use both character and word entropy
+		return charEntropy >= charEntropyThreshold || wordEntropy >= wordEntropyThreshold;
+	}
+
+	// Calculate Shannon entropy of a string or array of strings
+	private calculateEntropy(input: string | string[]): number {
+		// Create frequency map
+		const frequencyMap = new Map<string, number>();
+		let totalElements = 0;
+		
+		if (typeof input === 'string') {
+			// Character-level entropy
+			for (const char of input) {
+				if (char.trim() === '') continue; // Skip whitespace for character entropy
+				totalElements++;
+				frequencyMap.set(char, (frequencyMap.get(char) || 0) + 1);
+			}
+		} else {
+			// Word-level entropy
+			for (const word of input) {
+				totalElements++;
+				frequencyMap.set(word, (frequencyMap.get(word) || 0) + 1);
+			}
+		}
+		
+		if (totalElements === 0) return 0;
+		
+		// Calculate Shannon entropy: -sum(p(x) * log2(p(x)))
+		let entropy = 0;
+		for (const count of frequencyMap.values()) {
+			const probability = count / totalElements;
+			entropy -= probability * Math.log2(probability);
+		}
+		
+		return entropy;
 	}
 
 	// -------------------------------------------------------------------
@@ -419,17 +563,17 @@ export default class OllamaSearchPlugin extends Plugin {
 			// Add a safety check to prevent infinite loops
 			let safetyCounter = 0;
 			const maxIterations = 100000; // Reasonable upper limit
-			
+						 
 			while (offset < arrayBuffer.byteLength && safetyCounter < maxIterations) {
 				safetyCounter++;
-				
+								 
 				try {
 					// Check if we have enough bytes left to read the ID length (2 bytes)
 					if (offset + 2 > arrayBuffer.byteLength) {
 						console.warn("Reached end of buffer while reading ID length");
 						break;
 					}
-					
+										 
 					// Read id length
 					const idLength = view.getUint16(offset, true);
 					offset += 2;
@@ -487,7 +631,7 @@ export default class OllamaSearchPlugin extends Plugin {
 					offset = Math.min(offset + 4, arrayBuffer.byteLength);
 				}
 			}
-			
+						 
 			if (safetyCounter >= maxIterations) {
 				console.warn("Reached maximum iterations while reading vectors file. File may be corrupted.");
 			}
@@ -504,16 +648,40 @@ export default class OllamaSearchPlugin extends Plugin {
 	// -------------------------------------------------------------------
 	// Embedding & Similarity
 	// -------------------------------------------------------------------
+	private normalizeText(text: string): string {
+		// Step 1: Convert to lowercase
+		let normalized = text.toLowerCase();
+		
+		// Step 2: Remove special characters, keeping alphanumeric, spaces, and some punctuation
+		// This regex keeps letters, numbers, spaces, periods, commas, and basic punctuation
+		// but removes unusual symbols, emojis, etc.
+		normalized = normalized.replace(/[^\w\s.,?!;:()\-'"]/g, ' ');
+		
+		// Step 3: Replace multiple spaces with a single space
+		normalized = normalized.replace(/\s+/g, ' ');
+		
+		return normalized.trim();
+	}
+
 	async getEmbedding(text: string, retryCount = 0): Promise<number[]> {
 		const maxRetries = 2; // Allow up to 2 retries
 		
 		try {
+			// Normalize the text before getting embedding
+			const normalizedText = this.normalizeText(text);
+			
+			// Apply instruction template for search queries
+			let inputText = normalizedText;
+			if (this.isSearchQuery) {
+				inputText = `Instruction: Retrieve a similar sentence. Query: ${normalizedText}`;
+			}
+			
 			const response = await fetch(`${this.settings.ollamaEndpoint}/api/embed`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					model: this.settings.modelName,
-					input: text
+					input: inputText
 				})
 			});
 			if (!response.ok) {
@@ -522,12 +690,10 @@ export default class OllamaSearchPlugin extends Plugin {
 			}
 			const data = await response.json();
 			
-			// The response format is different - embeddings is an array of arrays
-			// We want the first (and likely only) embedding
+			// The response format is arrays of embeddings; we want the first
 			return data.embeddings?.[0] || [];
 		} catch (err) {
 			this.logError(`Failed to get embedding from Ollama`, err.message || err.toString());
-			
 			new Notice(`Failed to get embedding from Ollama: ${err.message}`);
 			console.error(err);
 			// Return an empty embedding to avoid further errors
@@ -535,21 +701,41 @@ export default class OllamaSearchPlugin extends Plugin {
 		}
 	}
 
-	cosineSimilarity(vecA: number[], vecB: number[]) {
+	cosineSimilarity(vecA: number[], vecB: number[]): number {
 		// Basic guard for length mismatch
 		if (vecA.length !== vecB.length || vecA.length === 0) {
 			return 0;
 		}
-		const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
-		const magA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
-		const magB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
 		
-		// FIX: Handle zero magnitude vectors
-		if (magA === 0 || magB === 0) {
+		// Calculate dot product while handling NaN values
+		let dotProduct = 0;
+		let magASquared = 0;
+		let magBSquared = 0;
+		
+		for (let i = 0; i < vecA.length; i++) {
+			// Skip NaN values
+			if (isNaN(vecA[i]) || isNaN(vecB[i])) {
+				continue;
+			}
+			
+			dotProduct += vecA[i] * vecB[i];
+			magASquared += vecA[i] * vecA[i];
+			magBSquared += vecB[i] * vecB[i];
+		}
+		
+		// Calculate magnitudes
+		const magA = Math.sqrt(magASquared);
+		const magB = Math.sqrt(magBSquared);
+		
+		// Handle zero or very small magnitudes with a small epsilon value
+		const epsilon = 1e-10;
+		if (magA < epsilon || magB < epsilon) {
 			return 0;
 		}
 		
-		return dotProduct / (magA * magB);
+		// Calculate and bound similarity to [-1, 1] range to handle floating point errors
+		const similarity = dotProduct / (magA * magB);
+		return Math.max(-1, Math.min(1, similarity));
 	}
 
 	// -------------------------------------------------------------------
@@ -562,31 +748,39 @@ export default class OllamaSearchPlugin extends Plugin {
 				throw new Error("Indexing in progress. Please try again later.");
 			}
 			
+			// Set the flag to indicate we're processing a search query
+			this.isSearchQuery = true;
+			
 			const queryEmbedding = await this.getEmbedding(query);
+			
+			// Reset the flag
+			this.isSearchQuery = false;
 			
 			// FIX: Check if embedding was successful
 			if (!queryEmbedding || queryEmbedding.length === 0) {
 				throw new Error("Failed to generate embedding for query");
 			}
 
-			// Use the vectorsCache to compare
-			const results: SearchResult[] = Array.from(this.vectorsCache.entries())
-				.map(([id, vector]) => {
-					const similarity = this.cosineSimilarity(queryEmbedding, vector);
-					const metadata = this.vectorIndex[id];
-					return { 
-						id,
-						similarity,
-						path: metadata.path,
-						title: metadata.title,
-						content: metadata.content
-					};
-				})
-				.sort((a, b) => b.similarity - a.similarity)
-				.slice(0, this.settings.maxResults);
+			// Minimum length check
+			if (query.trim().length < 3) {
+				throw new Error('Search query must be at least 3 characters long');
+			}
 
+			// Use the vectorsCache to compare
+			const results: SearchResult[] = [];
+			for (const [id, vector] of this.vectorsCache.entries()) {
+				const meta = this.vectorIndex[id];
+				const similarity = this.cosineSimilarity(queryEmbedding, vector);
+				results.push({ id, similarity, path: meta.path, title: meta.title, content: meta.content, blockRef: meta.blockRef });
+			}
+			results.sort((a, b) => b.similarity - a.similarity);
+			if (results.length > this.settings.maxResults) {
+				results.length = this.settings.maxResults;
+			}
 			return results;
 		} catch (error) {
+			// Make sure to reset the flag even if there's an error
+			this.isSearchQuery = false;
 			this.logError("Search error", error.message || error.toString());
 			console.error("Search error:", error);
 			return [];
@@ -630,12 +824,19 @@ export default class OllamaSearchPlugin extends Plugin {
 	// New method for batch embedding
 	async getBatchEmbeddings(texts: string[]): Promise<number[][]> {
 		try {
+			// For document chunks, we don't need to add instructions
+			// The isSearchQuery flag should be false here
+			this.isSearchQuery = false;
+			
+			// Normalize each text in the batch
+			const normalizedTexts = texts.map(text => this.normalizeText(text));
+			
 			const response = await fetch(`${this.settings.ollamaEndpoint}/api/embed`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					model: this.settings.modelName,
-					input: texts
+					input: normalizedTexts
 				})
 			});
 			
@@ -653,393 +854,525 @@ export default class OllamaSearchPlugin extends Plugin {
 			return [];
 		}
 	}
+
+	// Incremental indexing helper methods
+	private async indexFile(file: TFile): Promise<void> {
+		try {
+			const stat = await this.app.vault.adapter.stat(file.path);
+			if (!stat) return;
+			// Check if file already indexed and up to date
+			const oldIds = (this.fileInfoMap.get(file.path)?.ids) || [];
+			if (oldIds.length > 0 && this.fileInfoMap.get(file.path)?.mtime === stat.mtime) {
+				return; // no update needed
+			}
+			// Remove old index entries for this file
+			for (const id of oldIds) {
+				this.vectorsCache.delete(id);
+				delete this.vectorIndex[id];
+			}
+			this.fileInfoMap.delete(file.path);
+			const content = await this.app.vault.read(file);
+			const chunks = this.chunkText(content, this.settings.chunkSize, this.settings.chunkOverlap);
+			const embeddings = await this.getBatchEmbeddings(chunks);
+			if (embeddings.length !== chunks.length) {
+				console.warn(`Embedding count mismatch for ${file.path}: got ${embeddings.length}, expected ${chunks.length}`);
+			}
+			const newIds: string[] = [];
+			for (let cIndex = 0; cIndex < chunks.length; cIndex++) {
+				const embedding = embeddings[cIndex] ?? [];
+				if (embedding.length === 0) {
+					continue;
+				}
+				let id: string;
+				do {
+					id = this.generateId();
+				} while (this.vectorIndex[id]);
+				const blockRef = `^chunk-${this.generateId().substring(0, 8)}`;
+				this.vectorsCache.set(id, embedding);
+				this.vectorIndex[id] = {
+					path: file.path,
+					title: file.basename,
+					mtime: stat.mtime,
+					chunkIndex: cIndex,
+					content: chunks[cIndex],
+					blockRef: blockRef,
+					tags: []
+				};
+				newIds.push(id);
+			}
+			// Update fileInfoMap
+			const tags = this.extractTagsFromContent(content);
+			this.fileInfoMap.set(file.path, { mtime: stat.mtime, tags: new Set(tags), ids: newIds });
+			// Persist updated index
+			await this.saveVectorIndex();
+			await this.saveVectorsToBinary(Array.from(this.vectorsCache.entries()).map(([id, vector]) => ({id, vector})));
+		} catch (error) {
+			this.logError(`Error indexing file ${file.path}`, error.message);
+			console.error(`Error indexing file ${file.path}:`, error);
+		}
+	}
+
+	private async removeFromIndex(filePath: string): Promise<void> {
+		const info = this.fileInfoMap.get(filePath);
+		if (!info) return;
+		for (const id of info.ids) {
+			this.vectorsCache.delete(id);
+			delete this.vectorIndex[id];
+		}
+		this.fileInfoMap.delete(filePath);
+		try {
+			await this.saveVectorIndex();
+			await this.saveVectorsToBinary(Array.from(this.vectorsCache.entries()).map(([id, vector]) => ({id, vector})));
+		} catch (error) {
+			this.logError(`Error removing index for file ${filePath}`, error.message);
+		}
+	}
+
+	private updateIndexForRename(oldPath: string, newPath: string, file: TFile): void {
+		const info = this.fileInfoMap.get(oldPath);
+		if (!info) return;
+		// Update vectorIndex entries
+		for (const id of info.ids) {
+			const entry = this.vectorIndex[id];
+			if (entry) {
+				entry.path = newPath;
+				entry.title = file.basename;
+			}
+		}
+		// Update fileInfoMap key
+		this.fileInfoMap.delete(oldPath);
+		info.mtime = file.stat.mtime;
+		this.fileInfoMap.set(newPath, info);
+		try {
+			this.saveVectorIndex();
+		} catch (error) {
+			this.logError(`Error updating index for rename ${oldPath} -> ${newPath}`, error.message);
+		}
+	}
+
+	// Extract tags from note content (including YAML frontmatter)
+	private extractTagsFromContent(text: string): string[] {
+		const tags: string[] = [];
+		// Extract tags from YAML frontmatter
+		if (text.startsWith('---')) {
+			const end = text.indexOf('\n---', 3);
+			if (end !== -1) {
+				const frontmatter = text.substring(0, end + 4);
+				const tagLines = frontmatter.match(/^tags:\s*(.+)$/m);
+				if (tagLines) {
+					const tagsLine = tagLines[1];
+					// Remove brackets and quotes, then split by commas or spaces
+					const clean = tagsLine.replace(/\[|\]|"|'/g, '');
+					tags.push(...clean.split(/[\s,]+/).filter(t => t));
+				}
+			}
+		}
+		// Extract inline #tags from content
+		const inlineTags = text.match(/#([A-Za-z0-9_\-\/]+)/g);
+		if (inlineTags) {
+			for (const tag of inlineTags) {
+				tags.push(tag.startsWith('#') ? tag.substring(1) : tag);
+			}
+		}
+		return Array.from(new Set(tags.map(t => t.toLowerCase())));
+	}
 }
 
 // -------------------------------------------------------------------
-// Modal for Searching
+// Search Modal
 // -------------------------------------------------------------------
 class SearchModal extends Modal {
-	plugin: OllamaSearchPlugin;
-	results: SearchResult[] = [];
-	searchInput: HTMLInputElement;
-	resultsContainer: HTMLDivElement;
-	searchTimeout: NodeJS.Timeout | null = null;
-	isSearching: boolean = false;
-	
-	constructor(app: App, plugin: OllamaSearchPlugin) {
-		super(app);
-		this.plugin = plugin;
-	}
+    plugin: OllamaSearchPlugin;
+    query: string = '';
+    results: SearchResult[] = [];
+    isLoading: boolean = false;
+    errorMessage: string = '';
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.createEl('h2', {text: 'Ollama Vector Search'});
+    constructor(app: App, plugin: OllamaSearchPlugin) {
+        super(app);
+        this.plugin = plugin;
+    }
 
-		// Create search input
-		const searchContainer = contentEl.createDiv();
-		this.searchInput = searchContainer.createEl('input', {
-			type: 'text',
-			placeholder: 'Search your notes...'
-		});
-		this.searchInput.style.width = '100%';
-		this.searchInput.style.marginBottom = '10px';
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.addClass('ollama-search-modal');
 
-		// Create results container
-		this.resultsContainer = contentEl.createDiv();
-		this.resultsContainer.style.maxHeight = '400px';
-		this.resultsContainer.style.overflow = 'auto';
+        // Create search input
+        const searchContainer = contentEl.createDiv({ cls: 'search-input-container' });
+        const searchInput = searchContainer.createEl('input', {
+            type: 'text',
+            placeholder: 'Search your notes semantically...'
+        });
+        searchInput.focus();
 
-		// Add initial message
-		this.resultsContainer.createEl('div', {
-			text: 'Type at least 3 characters to search...',
-			cls: 'search-initial-message'
-		});
+        // Create results container
+        const resultsContainer = contentEl.createDiv({ cls: 'search-results-container' });
+        resultsContainer.createDiv({ 
+            cls: 'search-initial-message',
+            text: 'Enter a search query to find semantically similar content in your notes.'
+        });
 
-		// Handle search with debouncing
-		this.searchInput.addEventListener('input', () => {
-			const query = this.searchInput.value;
-			
-			// Clear any pending search
-			if (this.searchTimeout) {
-				clearTimeout(this.searchTimeout);
-			}
-			
-			// If query is too short, show message and don't search
-			if (query.length < 3) {
-				this.clearResults();
-				this.resultsContainer.createEl('div', {
-					text: 'Type at least 3 characters to search...',
-					cls: 'search-initial-message'
-				});
-				return;
-			}
-			
-			// Show loading indicator
-			if (!this.isSearching) {
-				this.showLoadingIndicator();
-			}
-			
-			// Debounce the search (wait 300ms after typing stops)
-			this.searchTimeout = setTimeout(() => {
-				this.performSearch(query);
-			}, 300);
-		});
+        // Handle search input
+        searchInput.addEventListener('input', async () => {
+            this.query = searchInput.value;
+            if (this.query.length < 3) {
+                resultsContainer.empty();
+                resultsContainer.createDiv({ 
+                    cls: 'search-initial-message',
+                    text: 'Enter at least 3 characters to search.'
+                });
+                return;
+            }
 
-		// Focus the input
-		this.searchInput.focus();
-	}
-	
-	clearResults() {
-		this.resultsContainer.empty();
-	}
-	
-	showLoadingIndicator() {
-		this.clearResults();
-		const loadingEl = this.resultsContainer.createEl('div', {
-			cls: 'search-loading'
-		});
-		loadingEl.innerHTML = 'Searching<span class="dot-one">.</span><span class="dot-two">.</span><span class="dot-three">.</span>';
-	}
-	
-	async performSearch(query: string) {
-		this.isSearching = true;
-		
-		try {
-			this.results = await this.plugin.searchSimilar(query);
-			
-			this.clearResults();
-			
-			if (this.results.length === 0) {
-				this.resultsContainer.createEl('div', {
-					text: 'No results found',
-					cls: 'search-no-results'
-				});
-				return;
-			}
+            // Show loading indicator
+            resultsContainer.empty();
+            const loadingDiv = resultsContainer.createDiv({ cls: 'search-loading' });
+            loadingDiv.setText('Searching');
+            loadingDiv.createSpan({ cls: 'dot-one', text: '.' });
+            loadingDiv.createSpan({ cls: 'dot-two', text: '.' });
+            loadingDiv.createSpan({ cls: 'dot-three', text: '.' });
+            
+            this.isLoading = true;
+            this.errorMessage = '';
 
-			// Create a document fragment to avoid multiple reflows
-			const fragment = document.createDocumentFragment();
-			
-			for (const result of this.results) {
-				const resultEl = document.createElement('div');
-				resultEl.className = 'search-result';
-				resultEl.style.padding = '8px';
-				resultEl.style.marginBottom = '8px';
-				resultEl.style.border = '1px solid var(--background-modifier-border)';
-				resultEl.style.borderRadius = '4px';
+            try {
+                // Debounce search to avoid too many requests
+                setTimeout(async () => {
+                    if (searchInput.value === this.query) {
+                        this.results = await this.plugin.searchSimilar(this.query);
+                        this.renderResults(resultsContainer);
+                    }
+                }, 300);
+            } catch (error) {
+                this.errorMessage = error.message || 'An error occurred during search';
+                this.renderResults(resultsContainer);
+            }
+        });
+    }
 
-				const titleEl = document.createElement('h3');
-				titleEl.textContent = result.title;
-				resultEl.appendChild(titleEl);
-				
-				const snippetEl = document.createElement('div');
-				snippetEl.className = 'search-result-snippet';
-				// Show the first ~150 characters of the chunk
-				const snippetText = result.content
-					? result.content.substring(0, 150).replace(/\n/g, ' ') + '...'
-					: 'No content available';
-				snippetEl.textContent = snippetText;
-				resultEl.appendChild(snippetEl);
+    renderResults(container: HTMLElement) {
+        container.empty();
+        this.isLoading = false;
 
-				resultEl.addEventListener('click', () => {
-					this.app.workspace.openLinkText(result.path, '');
-					this.close();
-				});
-				
-				fragment.appendChild(resultEl);
-			}
-			
-			this.resultsContainer.appendChild(fragment);
-			
-		} catch (error) {
-			this.clearResults();
-			
-			// Create a more informative error message
-			const errorEl = this.resultsContainer.createEl('div', {
-				cls: 'search-error'
-			});
-			
-			// Main error message
-			errorEl.createEl('p', {
-				text: `Error: ${error.message || 'Failed to search'}`
-			});
-			
-			// Add troubleshooting tips
-			const tipsList = errorEl.createEl('ul');
-			tipsList.createEl('li', {
-				text: 'Make sure Ollama is running on your machine'
-			});
-			tipsList.createEl('li', {
-				text: `Check that the model "${this.plugin.settings.modelName}" is available in Ollama`
-			});
-			tipsList.createEl('li', {
-				text: 'Verify your Ollama endpoint in the plugin settings'
-			});
-			
-		} finally {
-			this.isSearching = false;
-		}
-	}
+        // Handle error state
+        if (this.errorMessage) {
+            container.createDiv({ 
+                cls: 'search-error', 
+                text: `Error: ${this.errorMessage}` 
+            });
+            return;
+        }
 
-	onClose() {
-		if (this.searchTimeout) {
-			clearTimeout(this.searchTimeout);
-		}
-		const {contentEl} = this;
-		contentEl.empty();
-	}
+        // Handle empty results
+        if (this.results.length === 0) {
+            container.createDiv({ 
+                cls: 'search-no-results', 
+                text: 'No results found.' 
+            });
+            return;
+        }
+
+        // Show result count
+        container.createDiv({ 
+            cls: 'search-results-count', 
+            text: `${this.results.length} result${this.results.length !== 1 ? 's' : ''}`
+        });
+        
+        // Create results list
+        const resultsList = container.createDiv({ cls: 'search-results-list' });
+        
+        // Render results
+        for (const result of this.results) {
+            const resultCard = resultsList.createDiv({ cls: 'search-result-card' });
+            
+            // Title with simple score
+            const titleDiv = resultCard.createDiv({ cls: 'search-result-title' });
+            titleDiv.createSpan({ text: result.title });
+            
+            // Add simple score
+            const scoreValue = (result.similarity * 100).toFixed(0);
+            titleDiv.createSpan({ 
+                cls: 'search-result-score',
+                text: `${scoreValue}%`
+            });
+            
+            // Path
+            resultCard.createDiv({ 
+                cls: 'search-result-path', 
+                text: result.path 
+            });
+            
+            // Content preview
+            const contentDiv = resultCard.createDiv({ cls: 'search-result-content' });
+            
+            // Format and truncate content
+            let snippetText = result.content.trim();
+            if (snippetText.length > 300) {
+                const breakPoint = snippetText.lastIndexOf(' ', 300);
+                snippetText = snippetText.substring(0, breakPoint > 0 ? breakPoint : 300) + '...';
+            }
+            contentDiv.setText(snippetText);
+            
+            // Handle click to open the file
+            resultCard.addEventListener('click', () => {
+                this.openResult(result);
+            });
+        }
+    }
+    
+    // Helper method to open a result
+    private openResult(result: SearchResult): void {
+        // Navigate to the file and position
+        const targetFile = this.app.vault.getAbstractFileByPath(result.path);
+        if (targetFile instanceof TFile) {
+            this.app.workspace.getLeaf().openFile(targetFile).then(() => {
+                // If we have a block reference, scroll to it
+                if (result.blockRef) {
+                    // Use setTimeout to ensure the editor is loaded
+                    setTimeout(() => {
+                        const currentView = this.app.workspace.getActiveViewOfType(MarkdownView);
+                        if (currentView) {
+                            const editor = currentView.editor;
+                            const content = editor.getValue();
+                            const blockPosition = content.indexOf(result.blockRef ?? '');
+                            
+                            if (blockPosition !== -1) {
+                                // Calculate line number
+                                const contentToBlock = content.substring(0, blockPosition);
+                                const lineCount = contentToBlock.split('\n').length - 1;
+                                
+                                // Scroll to position
+                                editor.setCursor({ line: lineCount, ch: 0 });
+                                editor.scrollIntoView({ from: { line: lineCount, ch: 0 }, to: { line: lineCount, ch: 0 } }, true);
+                            }
+                        }
+                    }, 100);
+                }
+            });
+            this.close();
+        }
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
 }
 
 // -------------------------------------------------------------------
 // Settings Tab
 // -------------------------------------------------------------------
 class OllamaSettingTab extends PluginSettingTab {
-	plugin: OllamaSearchPlugin;
+    plugin: OllamaSearchPlugin;
 
-	constructor(app: App, plugin: OllamaSearchPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    constructor(app: App, plugin: OllamaSearchPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
 
-	display(): void {
-		const {containerEl} = this;
-		containerEl.empty();
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
 
-		containerEl.createEl('h2', {text: 'Ollama Vector Search Settings'});
+        containerEl.createEl('h2', { text: 'Ollama Vector Search Settings' });
 
-		new Setting(containerEl)
-			.setName('Ollama Endpoint')
-			.setDesc('URL of your Ollama instance')
-			.addText(text => text
-				.setPlaceholder('http://localhost:11434')
-				.setValue(this.plugin.settings.ollamaEndpoint)
-				.onChange(async (value) => {
-					this.plugin.settings.ollamaEndpoint = value;
-					await this.plugin.saveSettings();
-				}));
+        // Ollama Endpoint
+        new Setting(containerEl)
+            .setName('Ollama Endpoint')
+            .setDesc('The URL of your Ollama server')
+            .addText(text => text
+                .setPlaceholder('http://localhost:11434')
+                .setValue(this.plugin.settings.ollamaEndpoint)
+                .onChange(async (value) => {
+                    this.plugin.settings.ollamaEndpoint = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		new Setting(containerEl)
-			.setName('Model Name')
-			.setDesc('Ollama model to use for embeddings')
-			.addText(text => text
-				.setPlaceholder('nomic-embed-text:latest')
-				.setValue(this.plugin.settings.modelName)
-				.onChange(async (value) => {
-					this.plugin.settings.modelName = value;
-					await this.plugin.saveSettings();
-				}));
-				
-		new Setting(containerEl)
-			.setName('Max Results')
-			.setDesc('Maximum number of search results to display')
-			.addText(text => text
-				.setPlaceholder('5')
-				.setValue(this.plugin.settings.maxResults.toString())
-				.onChange(async (value) => {
-					// FIX: Validate input
-					const numValue = parseInt(value);
-					if (isNaN(numValue) || numValue < 1) {
-						new Notice("Max results must be a positive number");
-						return;
-					}
-					this.plugin.settings.maxResults = numValue;
-					await this.plugin.saveSettings();
-				}));
+        // Model Name
+        new Setting(containerEl)
+            .setName('Embedding Model')
+            .setDesc('The name of the embedding model to use')
+            .addText(text => text
+                .setPlaceholder('jeffh/intfloat-multilingual-e5-large-instruct:q8_0')
+                .setValue(this.plugin.settings.modelName)
+                .onChange(async (value) => {
+                    this.plugin.settings.modelName = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		new Setting(containerEl)
-			.setName('Chunk Size (characters)')
-			.setDesc('Length of each text chunk for embeddings')
-			.addText(text => text
-				.setPlaceholder('1000')
-				.setValue(this.plugin.settings.chunkSize.toString())
-				.onChange(async (value) => {
-					// FIX: Validate input
-					const numValue = parseInt(value);
-					if (isNaN(numValue) || numValue < 100) {
-						new Notice("Chunk size must be at least 100 characters");
-						return;
-					}
-					this.plugin.settings.chunkSize = numValue;
-					await this.plugin.saveSettings();
-				}));
+        // Max Results
+        new Setting(containerEl)
+            .setName('Max Results')
+            .setDesc('Maximum number of search results to display')
+            .addSlider(slider => slider
+                .setLimits(1, 20, 1)
+                .setValue(this.plugin.settings.maxResults)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.maxResults = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		new Setting(containerEl)
-			.setName('Chunk Overlap (characters)')
-			.setDesc('Overlap between consecutive chunks')
-			.addText(text => text
-				.setPlaceholder('200')
-				.setValue(this.plugin.settings.chunkOverlap.toString())
-				.onChange(async (value) => {
-					// FIX: Validate input
-					const numValue = parseInt(value);
-					if (isNaN(numValue) || numValue < 0) {
-						new Notice("Chunk overlap must be a non-negative number");
-						return;
-					}
-					this.plugin.settings.chunkOverlap = numValue;
-					await this.plugin.saveSettings();
-				}));
+        // Chunk Size
+        new Setting(containerEl)
+            .setName('Chunk Size')
+            .setDesc('Size of text chunks in characters')
+            .addSlider(slider => slider
+                .setLimits(500, 3000, 100)
+                .setValue(this.plugin.settings.chunkSize)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.chunkSize = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		// Index status
-		new Setting(containerEl)
-			.setName('Index Status')
-			.setDesc(this.plugin.isIndexed ? 
-				`Vector index exists with ${Object.keys(this.plugin.vectorIndex).length} entries` : 
-				'No vector index found')
-			.addButton(button => button
-				.setButtonText(this.plugin.isIndexed ? 'Rebuild Index' : 'Build Index')
-				.setCta()
-				.setDisabled(this.plugin.isIndexing) // FIX: Disable during indexing
-				.onClick(async () => {
-					button.setButtonText('Indexing...');
-					button.setDisabled(true);
+        // Chunk Overlap
+        new Setting(containerEl)
+            .setName('Chunk Overlap')
+            .setDesc('Overlap between chunks in characters')
+            .addSlider(slider => slider
+                .setLimits(0, 500, 50)
+                .setValue(this.plugin.settings.chunkOverlap)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.chunkOverlap = value;
+                    await this.plugin.saveSettings();
+                }));
 
-					try {
-						// Pass true to force a rebuild when clicking "Rebuild Index"
-						const forceRebuild = this.plugin.isIndexed;
-						await this.plugin.buildVectorIndex(forceRebuild);
-						button.setButtonText(this.plugin.isIndexed ? 'Rebuild Index' : 'Build Index');
-						button.setDisabled(false);
-					} catch (error) {
-						new Notice(`Indexing failed: ${error.message}`);
-						button.setButtonText('Retry Indexing');
-						button.setDisabled(false);
-					}
-				}));
+        // Auto-index toggle
+        new Setting(containerEl)
+            .setName('Auto-Index')
+            .setDesc('Automatically update index when files change')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.autoIndex)
+                .onChange(async (value) => {
+                    this.plugin.settings.autoIndex = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		// Error logs section
-		containerEl.createEl('h3', {text: 'Error Logs'});
-		
-		const errorLogContainer = containerEl.createDiv({cls: 'error-log-container'});
-		
-		if (this.plugin.settings.errorLogs.length === 0) {
-			errorLogContainer.createEl('div', {
-				text: 'No errors logged',
-				cls: 'error-log-empty'
-			});
-		} else {
-			const table = errorLogContainer.createEl('table');
-			const headerRow = table.createEl('tr');
-			headerRow.createEl('th', {text: 'Time'});
-			headerRow.createEl('th', {text: 'Error'});
-			headerRow.createEl('th', {text: 'Actions'});
-			
-			for (const error of this.plugin.settings.errorLogs) {
-				const row = table.createEl('tr');
-				
-				// Format timestamp
-				const date = new Date(error.timestamp);
-				row.createEl('td', {
-					text: date.toLocaleString()
-				});
-				
-				// Error message
-				row.createEl('td', {
-					text: error.message
-				});
-				
-				// Actions cell
-				const actionsCell = row.createEl('td');
-				
-				// View details button (only if details exist)
-				if (error.details) {
-					const viewButton = actionsCell.createEl('button', {
-						text: 'Details',
-						cls: 'mod-cta'
-					});
-					viewButton.style.marginRight = '5px';
-					viewButton.addEventListener('click', () => {
-						// Toggle details row
-						const detailsId = `error-${error.timestamp}`;
-						const existingDetails = table.querySelector(`#${detailsId}`);
-						
-						if (existingDetails) {
-							existingDetails.remove();
-						} else {
-							const detailsRow = table.createEl('tr', {
-								cls: 'error-details-row'
-							});
-							detailsRow.id = detailsId;
-							
-							const detailsCell = detailsRow.createEl('td', {
-								attr: {colspan: '3'}
-							});
-							
-							const pre = detailsCell.createEl('pre');
-							pre.createEl('code', {
-								text: error.details
-							});
-							
-							// Insert after the current row
-							row.after(detailsRow);
-						}
-					});
-				}
-			}
-			
-			// Add clear logs button
-			const clearButtonContainer = errorLogContainer.createDiv();
-			clearButtonContainer.style.marginTop = '10px';
-			clearButtonContainer.style.textAlign = 'right';
-			
-			const clearButton = clearButtonContainer.createEl('button', {
-				text: 'Clear Error Logs',
-				cls: 'mod-warning'
-			});
-			
-			clearButton.addEventListener('click', async () => {
-				this.plugin.settings.errorLogs = [];
-				await this.plugin.saveSettings();
-				this.display(); // Refresh the settings tab
-			});
-		}
-	}
+        // Excluded Folders
+        new Setting(containerEl)
+            .setName('Excluded Folders')
+            .setDesc('Folders to exclude from indexing (comma-separated)')
+            .addText(text => text
+                .setPlaceholder('templates, attachments')
+                .setValue(this.plugin.settings.excludeFolders.join(', '))
+                .onChange(async (value) => {
+                    this.plugin.settings.excludeFolders = value.split(',').map(s => s.trim()).filter(s => s);
+                    await this.plugin.saveSettings();
+                }));
+
+        // Index Building
+        containerEl.createEl('h3', { text: 'Index Management' });
+
+        const indexStatus = containerEl.createDiv({ cls: 'index-status' });
+        if (this.plugin.isIndexed) {
+            indexStatus.createSpan({ text: 'Index Status: ', cls: 'index-status-label' });
+            indexStatus.createSpan({ 
+                text: `Indexed (${Object.keys(this.plugin.vectorIndex).length} chunks)`, 
+                cls: 'index-status-value' 
+            });
+        } else {
+            indexStatus.createSpan({ text: 'Index Status: ', cls: 'index-status-label' });
+            indexStatus.createSpan({ text: 'Not indexed', cls: 'index-status-value' });
+        }
+
+        // Build Index Button
+        new Setting(containerEl)
+            .setName('Build Index')
+            .setDesc('Build or rebuild the vector index')
+            .addButton(button => button
+                .setButtonText(this.plugin.isIndexed ? 'Rebuild Index' : 'Build Index')
+                .setCta()
+                .onClick(async () => {
+                    if (this.plugin.isIndexing) {
+                        new Notice('Indexing already in progress');
+                        return;
+                    }
+                    
+                    try {
+                        button.setButtonText('Indexing...');
+                        button.setDisabled(true);
+                        
+                        await this.plugin.buildVectorIndex(true);
+                        
+                        button.setButtonText('Rebuild Index');
+                        button.setDisabled(false);
+                        
+                        // Update index status
+                        indexStatus.empty();
+                        indexStatus.createSpan({ text: 'Index Status: ', cls: 'index-status-label' });
+                        indexStatus.createSpan({ 
+                            text: `Indexed (${Object.keys(this.plugin.vectorIndex).length} chunks)`, 
+                            cls: 'index-status-value' 
+                        });
+                    } catch (error) {
+                        button.setButtonText(this.plugin.isIndexed ? 'Rebuild Index' : 'Build Index');
+                        button.setDisabled(false);
+                        new Notice(`Indexing failed: ${error.message}`);
+                    }
+                }));
+
+        // Error Logs
+        containerEl.createEl('h3', { text: 'Error Logs' });
+        
+        const errorLogContainer = containerEl.createDiv({ cls: 'error-log-container' });
+        
+        if (this.plugin.settings.errorLogs.length === 0) {
+            errorLogContainer.createDiv({ 
+                cls: 'error-log-empty',
+                text: 'No errors logged'
+            });
+        } else {
+            const table = errorLogContainer.createEl('table');
+            const headerRow = table.createEl('tr');
+            headerRow.createEl('th', { text: 'Time' });
+            headerRow.createEl('th', { text: 'Error' });
+            
+            // Show the 10 most recent errors
+            const recentErrors = this.plugin.settings.errorLogs.slice(0, 10);
+            
+            for (const error of recentErrors) {
+                const row = table.createEl('tr');
+                
+                // Format timestamp
+                const date = new Date(error.timestamp);
+                const formattedDate = `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
+                
+                row.createEl('td', { text: formattedDate });
+                row.createEl('td', { text: error.message });
+                
+                // If there are details, add them in a collapsible row
+                if (error.details) {
+                    const detailsRow = table.createEl('tr', { cls: 'error-details-row' });
+                    const detailsCell = detailsRow.createEl('td', { attr: { colspan: '2' } });
+                    detailsCell.createEl('pre', { text: error.details });
+                    
+                    // Initially hide details
+                    detailsRow.style.display = 'none';
+                    
+                    // Toggle details on click
+                    row.addEventListener('click', () => {
+                        detailsRow.style.display = detailsRow.style.display === 'none' ? 'table-row' : 'none';
+                    });
+                    
+                    // Add pointer cursor to indicate clickable
+                    row.style.cursor = 'pointer';
+                }
+            }
+            
+            // Add clear logs button
+            new Setting(containerEl)
+                .setName('Clear Error Logs')
+                .setDesc('Remove all error logs')
+                .addButton(button => button
+                    .setButtonText('Clear Logs')
+                    .onClick(async () => {
+                        this.plugin.settings.errorLogs = [];
+                        await this.plugin.saveSettings();
+                        this.display(); // Refresh the display
+                    }));
+        }
+    }
 }
-
-
-
-
-
-
-
- 
